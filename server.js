@@ -8,15 +8,14 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
-app.use(express.json({ limit: '1mb' }));
-// CORS: allow ANY origin (dashboard is on different domain than Render)
-// Must allow OPTIONS preflight or browser fetch from dashboard will show "Failed to fetch" even when tab works
+// CORS MUST be FIRST - before express.json, before routes
+// If cors() is after json/routes, preflight OPTIONS fails and browser shows "Failed to fetch" even when tab works
 app.use(cors({
   origin: '*',
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
 }));
-app.options('*', cors());
+app.use(express.json({ limit: '1mb' }));
 
 // ---------- CONFIG - ALL FROM .env, NEVER hardcode ----------
 const DC = process.env.ZOHO_DC || 'com'; // com, eu, in, au
