@@ -17,12 +17,21 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 // Serve dashboard from SAME origin - kills CORS/sandbox issues forever
-// Put index.html in same folder as server.js on Render, or in /public
+// index.html MUST be in repo ROOT (same folder as server.js) on Render
+// -> /opt/render/project/src/index.html, NOT in /public
 const path = require('path');
 const fs = require('fs');
-const dashboardPath = fs.existsSync(path.join(__dirname, 'index.html')) ? path.join(__dirname, 'index.html') : path.join(__dirname, 'public', 'index.html');
-app.get('/', (req, res) => { res.sendFile(dashboardPath); });
-app.get('/dashboard', (req, res) => { res.sendFile(dashboardPath); });
+function sendDashboard(req, res){
+  const candidates = [
+    path.join(__dirname, 'index.html'),
+    path.join(__dirname, 'public', 'index.html'),
+  ];
+  for(const p of candidates){ if(fs.existsSync(p)) return res.sendFile(p); }
+  // Never crash with ENOENT - show helpful page instead
+  return res.status(404).send('<h2>Dashboard file missing on Render</h2><p>Upload <b>index.html</b> to the <b>repo ROOT</b> (same folder as server.js), not in /public. Then redeploy.</p><p>Checked: '+candidates.join(' | ')+'</p><p><a href="/api/health">Check /api/health</a></p>');
+}
+app.get('/', sendDashboard);
+app.get('/dashboard', sendDashboard);
 
 // ---------- CONFIG - ALL FROM .env, NEVER hardcode ----------
 const DC = process.env.ZOHO_DC || 'com'; // com, eu, in, au
