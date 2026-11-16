@@ -1,93 +1,186 @@
-
+require('dotenv').config();
+// ============================================================
+// Zoho Desk Live Dashboard - Backend Server
+// Proxy + Auto Refresh + Webhook + SSE
+// Deploy to Render / Railway / VPS
+// ============================================================
 const express = require('express');
-// Node 18+ has global fetch built-in - no node-fetch needed
+const cors = require('cors');
 const app = express();
-const PORT = process.env.PORT || 3001;
 
-// ===== CORS - FIX FOR DASHBOARD FETCH =====
-// Must be BEFORE all routes. Allows any origin (your Meta AI artifact + Render dashboard) to call the proxy.
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-  res.header('Access-Control-Max-Age', '86400');
-  // Handle preflight - browser sends OPTIONS before GET/POST when cross-origin
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
-  next();
-});
+// CORS MUST be FIRST - before express.json, before routes
+// If cors() is after json/routes, preflight OPTIONS fails and browser shows "Failed to fetch" even when tab works
+app.use(cors({
+  origin: '*',
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+}));
+app.use(express.json({ limit: '1mb' }));
 
-app.use(express.json());
-
-const DC = process.env.ZOHO_DC || 'com';
+// ---------- CONFIG - ALL FROM .env, NEVER hardcode ----------
+const DC = process.env.ZOHO_DC || 'com'; // com, eu, in, au
 const ORG_ID = process.env.ZOHO_ORG_ID;
 const CLIENT_ID = process.env.ZOHO_CLIENT_ID;
 const CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
-let REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
-let ACCESS_TOKEN = null;
-let TOKEN_EXPIRY = 0;
+const REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
+const PORT = process.env.PORT || 3001;
 
-async function getAccessToken() {
-  if (ACCESS_TOKEN && Date.now() < TOKEN_EXPIRY - 60000) return ACCESS_TOKEN;
-  const params = new URLSearchParams();
-  params.append('refresh_token', REFRESH_TOKEN);
-  params.append('client_id', CLIENT_ID);
-  params.append('client_secret', CLIENT_SECRET);
-  params.append('grant_type', 'refresh_token');
-  const r = await fetch(`https://accounts.zoho.${DC}/oauth/v2/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString()
+const DESK_BASE = `https://desk.zoho.${DC}/api/v1`;
+const ACCOUNTS_BASE = `https://accounts.zoho.${DC}/oauth/v2/token`;
+
+// ---------- TOKEN CACHE ----------
+let tokenCache = { accessToken: null, expiresAt: 0 };
+
+async function refreshAccessToken() {
+  console.log('[Zoho] Refreshing access token...');
+  const params = new URLSearchParams({
+    refresh_token: REFRESH_TOKEN,
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    grant_type: 'refresh_token',
   });
-  const j = await r.json();
-  if (j.error) throw new Error(`Token refresh failed: ${JSON.stringify(j)}`);
-  ACCESS_TOKEN = j.access_token;
-  TOKEN_EXPIRY = Date.now() + (j.expires_in || 3600) * 1000;
-  return ACCESS_TOKEN;
+  const res = await fetch(`${ACCOUNTS_BASE}?${params.toString()}`, { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok || !data.access_token) {
+    console.error('[Zoho] Refresh failed:', data);
+    throw new Error('Token refresh failed: ' + JSON.stringify(data));
+  }
+  // Refresh 5 mins early
+  tokenCache = {
+    accessToken: data.access_token,
+    expiresAt: Date.now() + (data.expires_in * 1000) - (5 * 60 * 1000),
+  };
+  console.log('[Zoho] Token refreshed, valid until', new Date(tokenCache.expiresAt).toISOString());
+  return tokenCache.accessToken;
 }
 
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true, orgId: ORG_ID ? ORG_ID.slice(0,4) + '...' : null, dc: DC, hasClientId: !!CLIENT_ID, hasRefresh: !!REFRESH_TOKEN, time: new Date().toISOString() });
-});
+async function getValidToken() {
+  if (!tokenCache.accessToken || Date.now() >= tokenCache.expiresAt) {
+    return await refreshAccessToken();
+  }
+  return tokenCache.accessToken;
+}
 
-app.get('/', (req, res) => {
-  res.send('<h2>Zoho Desk Proxy LIVE</h2><p>Health: <a href="/api/health">/api/health</a> | Tickets: <a href="/api/tickets?limit=100&from=1">/api/tickets?limit=100&from=1</a></p><p>CORS: * + OPTIONS enabled</p>');
+// ---------- ZOHO CALLER WITH 401 RETRY ----------
+async function zoho(path, orgId = ORG_ID) {
+  let token = await getValidToken();
+  let res = await fetch(DESK_BASE + path, {
+    headers: { Authorization: 'Zoho-oauthtoken ' + token, orgId },
+  });
+  // Auto-retry once on 401
+  if (res.status === 401) {
+    console.log('[Zoho] 401 - refreshing and retrying', path);
+    token = await refreshAccessToken();
+    res = await fetch(DESK_BASE + path, {
+      headers: { Authorization: 'Zoho-oauthtoken ' + token, orgId },
+    });
+  }
+  return res;
+}
+
+// ---------- SSE CLIENTS ----------
+let sseClients = [];
+function broadcast(event) {
+  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  sseClients = sseClients.filter(c => !c.destroyed);
+  sseClients.forEach(c => c.write(payload));
+  console.log('[SSE] Broadcast:', event.type, event.ticketNumber || '');
+}
+
+// ---------- API ROUTES (PROXY) ----------
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    dc: DC,
+    orgId: ORG_ID ? 'set' : 'missing',
+    tokenValidUntil: tokenCache.expiresAt ? new Date(tokenCache.expiresAt).toISOString() : null,
+    expiresInSec: tokenCache.expiresAt ? Math.max(0, Math.floor((tokenCache.expiresAt - Date.now()) / 1000)) : 0,
+    sseClients: sseClients.length,
+    lastWebhookAt: lastWebhookAt,
+  });
 });
 
 app.get('/api/tickets', async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 100, 100); // Zoho max 100
-    const from = parseInt(req.query.from) || 1;
-    const sortBy = req.query.sortBy || 'createdTime';
-    const token = await getAccessToken();
-    // Zoho Desk API: GET /api/v1/tickets?orgId=...&limit=100&from=1&sortBy=createdTime&sortOrder=desc
-    const url = `https://desk.zoho.${DC}/api/v1/tickets?orgId=${ORG_ID}&limit=${limit}&from=${from}&sortBy=${sortBy}&sortOrder=desc`;
-    const r = await fetch(url, { headers: { 'Authorization': `Zoho-oauthtoken ${token}`, 'orgId': ORG_ID } });
-    const text = await r.text();
-    let j;
-    try { j = JSON.parse(text); } catch { j = { raw: text }; }
-    if (j.error || j.errorCode) return res.status(502).json(j);
-    // Return as {data:[...]} so dashboard can use j.data
-    if (Array.isArray(j)) return res.json({ data: j });
-    return res.json(j);
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
+    const qs = new URLSearchParams({
+      limit: Math.min(parseInt(req.query.limit || '100'), 100).toString(),
+      sortBy: 'modifiedTime',
+      ...(req.query.departmentId ? { departmentId: req.query.departmentId } : {}),
+      ...(req.query.from ? { from: req.query.from } : {}),
+    }).toString();
+    const r = await zoho(`/tickets?${qs}`, req.query.orgId);
+    res.status(r.status).send(await r.text());
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/agents', async (req, res) => {
   try {
-    const token = await getAccessToken();
-    const r = await fetch(`https://desk.zoho.${DC}/api/v1/agents?orgId=${ORG_ID}&limit=100`, { headers: { 'Authorization': `Zoho-oauthtoken ${token}` } });
-    const j = await r.json();
-    return res.json(j);
-  } catch (e) { return res.status(500).json({ error: e.message }); }
+    const r = await zoho(`/agents?${new URLSearchParams(req.query).toString()}`, req.query.orgId);
+    res.status(r.status).send(await r.text());
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+app.get('/api/departments', async (req, res) => {
+  try {
+    const r = await zoho('/departments', req.query.orgId);
+    res.status(r.status).send(await r.text());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/tickets/:id/threads', async (req, res) => {
+  try {
+    const r = await zoho(`/tickets/${req.params.id}/threads`, req.query.orgId);
+    res.status(r.status).send(await r.text());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------- WEBHOOK ----------
+let lastWebhookAt = null;
+let webhookLog = [];
 
 app.post('/webhook/zoho', (req, res) => {
-  console.log('Zoho webhook:', JSON.stringify(req.body).slice(0, 500));
-  res.json({ ok: true });
+  const body = req.body || {};
+  // Zoho sends different shapes - handle both
+  const ticket = body.ticket || body || {};
+  const event = {
+    type: body.event || 'ticket.updated',
+    ticketNumber: ticket.ticketNumber || ticket.ticket_number || 'unknown',
+    subject: ticket.subject || '',
+    status: ticket.status || ticket.statusType || '',
+    priority: ticket.priority || '',
+    assignee: ticket.assignee?.firstName ? `${ticket.assignee.firstName} ${ticket.assignee.lastName || ''}` : (ticket.assignee || ''),
+    department: ticket.department?.name || ticket.departmentId || '',
+    modifiedTime: ticket.modifiedTime || new Date().toISOString(),
+    receivedAt: new Date().toISOString(),
+  };
+  lastWebhookAt = event.receivedAt;
+  webhookLog.unshift(event);
+  webhookLog = webhookLog.slice(0, 100);
+  console.log('[Webhook] Received:', event);
+  broadcast(event);
+  // Must respond 200 quickly or Zoho retries
+  res.status(200).json({ ok: true });
 });
 
-app.listen(PORT, () => console.log(`Proxy listening on ${PORT} - CORS * + OPTIONS enabled`));
+app.get('/api/webhook-log', (req, res) => res.json(webhookLog));
+
+// ---------- SSE STREAM ----------
+app.get('/webhook/stream', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write(`data: ${JSON.stringify({ type: 'connected', at: new Date().toISOString() })}\n\n`);
+  sseClients.push(res);
+  req.on('close', () => { sseClients = sseClients.filter(c => c !== res); });
+});
+
+app.listen(PORT, () => {
+  console.log(`\n✅ Zoho Desk Proxy running on port ${PORT}`);
+  console.log(`   Health:  http://localhost:${PORT}/api/health`);
+  console.log(`   Tickets: http://localhost:${PORT}/api/tickets`);
+  console.log(`   Webhook: POST http://localhost:${PORT}/webhook/zoho`);
+  console.log(`   SSE:     GET  http://localhost:${PORT}/webhook/stream`);
+  console.log(`   DC: ${DC} | Org: ${ORG_ID ? 'set' : 'MISSING - set .env'}\n`);
+});
