@@ -1,21 +1,20 @@
 
-require('dotenv').config();
 // ============================================================
 // Zoho Desk Live Dashboard - Backend Server
 // Proxy + Auto Refresh + Webhook + SSE
 // Deploy to Render / Railway / VPS
 // ============================================================
 const express = require('express');
-const cors = require('cors');
 const app = express();
-
-// CORS MUST be FIRST - before express.json, before routes
-// If cors() is after json/routes, preflight OPTIONS fails and browser shows "Failed to fetch" even when tab works
-app.use(cors({
-  origin: '*',
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-}));
+// CORS - manual, no cors package needed
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.header('Access-Control-Max-Age', '86400');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.use(express.json({ limit: '1mb' }));
 
 // ---------- CONFIG - ALL FROM .env, NEVER hardcode ----------
