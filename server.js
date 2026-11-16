@@ -1,6 +1,6 @@
 
 const express = require('express');
-const fetch = require('node-fetch');
+// Node 18+ has global fetch built-in - no node-fetch needed
 const app = express();
 const PORT = process.env.PORT || 3001;
 
